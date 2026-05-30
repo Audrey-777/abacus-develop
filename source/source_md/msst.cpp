@@ -11,7 +11,7 @@ MSST::MSST(const Parameter& param_in, UnitCell& unit_in) : MD_base(param_in, uni
 {
     msst_qmass = mdp.msst_qmass / pow(ModuleBase::ANGSTROM_AU, 4) / pow(ModuleBase::AU_to_MASS, 2);
     msst_vel = mdp.msst_vel * ModuleBase::ANGSTROM_AU * ModuleBase::AU_to_FS;
-    msst_vis = mdp.msst_vis / ModuleBase::AU_to_MASS / ModuleBase::ANGSTROM_AU * ModuleBase::AU_to_FS;
+    msst_vis = mdp.msst_vis / ModuleBase::AU_TO_MASS / ModuleBase::ANGSTROM_AU * ModuleBase::AU_to_FS;
 
     assert(ucell.nat>0);
 
@@ -24,7 +24,7 @@ MSST::MSST(const Parameter& param_in, UnitCell& unit_in) : MD_base(param_in, uni
     totmass = 0;
     lag_pos = 0;
     vsum = 0;
-    
+
     for (int i = 0; i < ucell.nat; ++i)
     {
         totmass += allmass[i];
@@ -67,8 +67,16 @@ void MSST::setup(ModuleESolver::ESolver* p_esolver, const std::string& global_re
             }
         }
 
-        MD_func::compute_stress(ucell, vel, allmass, cal_stress, virial, stress);
-        t_current = MD_func::current_temp(kinetic, ucell.nat, frozen_freedom_, allmass, vel);
+        // === 重构：使用纯函数 calc_stress_state / calc_kinetic_state ===
+        if (cal_stress)
+        {
+            MDStressState sstate = MD_func::calc_stress_state(ucell, vel, allmass, virial);
+            stress = sstate.stress;
+        }
+
+        MDKineticState kstate = MD_func::calc_kinetic_state(ucell.nat, frozen_freedom_, allmass, vel);
+        kinetic   = kstate.kinetic;
+        t_current = kstate.temperature;
     }
 
     ModuleBase::timer::end("MSST", "setup");
@@ -144,8 +152,17 @@ void MSST::second_half()
     propagate_vel();
 
     vsum = vel_sum();
-    MD_func::compute_stress(ucell, vel, allmass, cal_stress, virial, stress);
-    t_current = MD_func::current_temp(kinetic, ucell.nat, frozen_freedom_, allmass, vel);
+
+    // === 重构：使用纯函数 calc_stress_state / calc_kinetic_state ===
+    if (cal_stress)
+    {
+        MDStressState sstate = MD_func::calc_stress_state(ucell, vel, allmass, virial);
+        stress = sstate.stress;
+    }
+
+    MDKineticState kstate = MD_func::calc_kinetic_state(ucell.nat, frozen_freedom_, allmass, vel);
+    kinetic   = kstate.kinetic;
+    t_current = kstate.temperature;
 
     /// propagate the time derivative of volume 1/2 step
     propagate_voldot();
