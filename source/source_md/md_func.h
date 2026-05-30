@@ -2,8 +2,7 @@
 #define MD_FUNC_H
 
 #include "source_esolver/esolver.h"
-
-class Parameter;
+#include "md_statistics.h" // === 新增：统计结构体定义 ===
 
 #ifdef __MPI
 #include <mpi.h> // MPI functions
@@ -107,6 +106,7 @@ void force_virial(ModuleESolver::ESolver* p_esolver,
                   ModuleBase::Vector3<double>* force,
                   const bool& cal_stress,
                   ModuleBase::matrix& virial);
+
 /**
  * @brief calculate the ionic kinetic energy
  *
@@ -116,6 +116,47 @@ void force_virial(ModuleESolver::ESolver* p_esolver,
  * @return the ionic kinetic energy
  */
 double kinetic_energy(const int& natom, const ModuleBase::Vector3<double>* vel, const double* allmass);
+
+// ============================================================================
+// === 新增：纯函数版本 —— 输入只读，返回明确结构体 =============================
+// ============================================================================
+
+/**
+ * @brief 计算动能和温度，返回纯结构体（无副作用）
+ *
+ * 纯函数版本：不修改任何外部变量，不产生副作用。
+ * 比 current_temp(kinetic, ...) 更安全，更适合单元测试和并行调用。
+ *
+ * @param natom 原子数
+ * @param frozen_freedom 冻结的自由度
+ * @param allmass 原子质量数组
+ * @param vel 原子速度数组
+ * @return MDKineticState 包含动能和温度
+ */
+MDKineticState calc_kinetic_state(const int natom,
+                                  const int frozen_freedom,
+                                  const double* allmass,
+                                  const ModuleBase::Vector3<double>* vel);
+
+/**
+ * @brief 计算离子动能应力贡献 + 总应力（纯函数）
+ *
+ * 纯函数版本：不修改 virial/stress 引用。调用者自行决定如何使用返回值。
+ *
+ * @param unit_in unitcell 信息
+ * @param vel 原子速度数组
+ * @param allmass 原子质量数组
+ * @param virial 晶格 virial 张量
+ * @return MDStressState 包含动能贡献张量和总应力
+ */
+MDStressState calc_stress_state(const UnitCell& unit_in,
+                                const ModuleBase::Vector3<double>* vel,
+                                const double* allmass,
+                                const ModuleBase::matrix& virial);
+
+// ============================================================================
+// === 原有写回式接口（保留为包装器，内部调用新纯函数，行为完全不变） =============
+// ============================================================================
 
 /**
  * @brief calculate the total stress tensor
@@ -191,6 +232,8 @@ double target_temp(const int& istep, const int& nstep, const double& tfirst, con
 
 /**
  * @brief get the current temperature
+ *
+ * （兼容旧接口，内部调用 calc_kinetic_state）
  *
  * @param kinetic kinetic energy
  * @param natom the number of atoms

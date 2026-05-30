@@ -1,8 +1,8 @@
 #include "md_func.h"
+#include "md_statistics.h" // === 新增 ===
 
 #include "source_base/global_variable.h"
 #include "source_base/timer.h"
-#include "source_io/module_parameter/parameter.h"
 
 
 namespace MD_func
@@ -40,6 +40,10 @@ double gaussrand()
     return xx;
 }
 
+// ============================================================================
+// === 1. kinetic_energy —— 保持不变（本来就是纯函数） ===========================
+// ============================================================================
+
 double kinetic_energy(const int& natom, const ModuleBase::Vector3<double>* vel, const double* allmass)
 {
     double ke = 0;
@@ -52,6 +56,71 @@ double kinetic_energy(const int& natom, const ModuleBase::Vector3<double>* vel, 
     return ke;
 }
 
+// ============================================================================
+// === 新增：calc_kinetic_state —— 纯函数版本 ==================================
+// ============================================================================
+
+MDKineticState calc_kinetic_state(const int natom,
+                                  const int frozen_freedom,
+                                  const double* allmass,
+                                  const ModuleBase::Vector3<double>* vel)
+{
+    MDKineticState state;
+    if (3 * natom == frozen_freedom)
+    {
+        state.kinetic     = 0.0;
+        state.temperature = 0.0;
+    }
+    else
+    {
+        state.kinetic     = kinetic_energy(natom, vel, allmass);
+        state.temperature = 2.0 * state.kinetic / static_cast<double>(3 * natom - frozen_freedom);
+    }
+    return state;
+}
+
+// ============================================================================
+// === 新增：calc_stress_state —— 纯函数版本 ====================================
+// ============================================================================
+
+MDStressState calc_stress_state(const UnitCell& unit_in,
+                                const ModuleBase::Vector3<double>* vel,
+                                const double* allmass,
+                                const ModuleBase::matrix& virial)
+{
+    MDStressState state;
+    // create(3,3) 会清零矩阵（flag_zero 默认为 true），所以下面用 += 是安全的
+    state.t_vector.create(3, 3);
+    state.stress.create(3, 3);
+
+    // 计算温度张量（与 temp_vector 逻辑一致）
+    for (int ion = 0; ion < unit_in.nat; ++ion)
+    {
+        for (int i = 0; i < 3; ++i)
+        {
+            for (int j = 0; j < 3; ++j)
+            {
+                state.t_vector(i, j) += allmass[ion] * vel[ion][i] * vel[ion][j];
+            }
+        }
+    }
+
+    // 总应力 = virial + t_vector/omega
+    for (int i = 0; i < 3; ++i)
+    {
+        for (int j = 0; j < 3; ++j)
+        {
+            state.stress(i, j) = virial(i, j) + state.t_vector(i, j) / unit_in.omega;
+        }
+    }
+
+    return state;
+}
+
+// ============================================================================
+// === 旧接口改为包装器（内部调用新纯函数，行为完全不变） =========================
+// ============================================================================
+
 void compute_stress(const UnitCell& unit_in,
                     const ModuleBase::Vector3<double>* vel,
                     const double* allmass,
@@ -61,17 +130,8 @@ void compute_stress(const UnitCell& unit_in,
 {
     if (cal_stress)
     {
-        ModuleBase::matrix t_vector;
-
-        temp_vector(unit_in.nat, vel, allmass, t_vector);
-
-        for (int i = 0; i < 3; ++i)
-        {
-            for (int j = 0; j < 3; ++j)
-            {
-                stress(i, j) = virial(i, j) + t_vector(i, j) / unit_in.omega;
-            }
-        }
+        MDStressState state = calc_stress_state(unit_in, vel, allmass, virial);
+        stress = state.stress;
     }
 
     return;
@@ -238,7 +298,7 @@ void init_vel(const UnitCell& unit_in,
     }
     else
     {
-        std::cout << " Random velocities according to initial temperature " 
+        std::cout << " Random velocities according to initial temperature "
                   << temperature * ModuleBase::Hartree_to_K << " K"
                   << std::endl;
         rand_vel(unit_in.nat, temperature, allmass, frozen_freedom, frozen, ionmbl, my_rank, vel);
@@ -300,7 +360,7 @@ void print_stress(std::ofstream& ofs, const ModuleBase::matrix& virial, const Mo
 
     const double unit_transform = ModuleBase::HARTREE_SI / pow(ModuleBase::BOHR_RADIUS_SI, 3) * 1.0e-8;
 
-    
+
     ofs << " ELECTRONIC      PART OF STRESS: " << virial_scalar * unit_transform << " kbar" << std::endl;
     ofs << " IONIC (KINETIC) PART OF STRESS: " << (stress_scalar - virial_scalar) * unit_transform << " kbar" << std::endl;
     ofs << " MD PRESSURE (ELECTRONS+IONS)  : " << stress_scalar * unit_transform << " kbar" << std::endl;
@@ -424,7 +484,7 @@ void get_mass_mbl(const UnitCell& unit_in,
     {
         for (int i = 0; i < unit_in.atoms[it].na; i++)
         {
-            allmass[ion] = unit_in.atoms[it].mass / ModuleBase::AU_to_MASS;
+            allmass[ion] = unit_in.atoms[it].mass / ModuleBase::AU_TO_MASS;
             ionmbl[ion] = unit_in.atoms[it].mbl[i];
             if (ionmbl[ion].x == 0) {
                 ++frozen.x;
@@ -450,23 +510,24 @@ double target_temp(const int& istep, const int& nstep, const double& tfirst, con
     return tfirst + delta * (tlast - tfirst);
 }
 
+// ============================================================================
+// === 旧接口 current_temp —— 改为包装器，调用 calc_kinetic_state =================
+// ============================================================================
+
 double current_temp(double& kinetic,
                     const int& natom,
                     const int& frozen_freedom,
                     const double* allmass,
                     const ModuleBase::Vector3<double>* vel)
 {
-    if (3 * natom == frozen_freedom)
-    {
-        kinetic = 0.0;
-        return 0.0;
-    }
-    else
-    {
-        kinetic = kinetic_energy(natom, vel, allmass);
-        return 2 * kinetic / (3 * natom - frozen_freedom);
-    }
+    MDKineticState state = calc_kinetic_state(natom, frozen_freedom, allmass, vel);
+    kinetic = state.kinetic;
+    return state.temperature;
 }
+
+// ============================================================================
+// === temp_vector —— 保持不变（被 nhchain.cpp::update_baro() 和 calc_stress_state 内部使用） ===
+// ============================================================================
 
 void temp_vector(const int& natom,
                  const ModuleBase::Vector3<double>* vel,
