@@ -1,0 +1,7 @@
+binary=/root/abacus-parallel-optimize-review/Review/parallel_optimize_tests/build/parallel_optimize_benchmark
+compiler=g++
+nat=2000000
+repeats=5
+threads=1,2,4,8,16
+OMP_PROC_BIND=close
+OMP_PLACES=cores
