@@ -19,7 +19,7 @@
 #include "source_io/module_parameter/parameter.h"
 
 #ifdef __CUDA
-// Forward-declare the CUDA kernel entry point (defined in nep_cuda_compute.cu).
+// Forward-declare the CUDA kernel entry points (defined in nep_cuda_compute.cu).
 // Avoid including ".cuh" here — it has __device__ syntax that g++ cannot parse.
 extern void nep_cuda_compute(
     int N,
@@ -36,6 +36,26 @@ extern void nep_cuda_compute(
     const double *ann_c, int num_para,
     const double *w0, const double *b0, const double *w1, const double *b1,
     const double *q_scaler,
+    double *potential, double *force, double *virial);
+
+// Combined compute + postprocess — single D2H round-trip.
+// Output: potential[1], force[3*N] interleaved, virial[9] summed, with unit conversion applied.
+extern void nep_cuda_compute_postprocessed(
+    int N,
+    const int *type,
+    const int *NN_radial, const int *NL_radial,
+    const int *NN_angular, const int *NL_angular,
+    const double *x12_radial, const double *y12_radial, const double *z12_radial,
+    const double *x12_angular, const double *y12_angular, const double *z12_angular,
+    int n_max_radial, int n_max_angular,
+    int basis_size_radial, int basis_size_angular,
+    int L_max, int num_L, int num_types, int num_types_sq, int num_c_radial,
+    int dim, int num_neurons1, int version,
+    const double *rc_radial, const double *rc_angular,
+    const double *ann_c, int num_para,
+    const double *w0, const double *b0, const double *w1, const double *b1,
+    const double *q_scaler,
+    double fact_e, double fact_f, double fact_v,
     double *potential, double *force, double *virial);
 #endif
 
@@ -102,7 +122,7 @@ void ESolver_NEP::runner(UnitCell& ucell, const int istep)
 #ifdef __CUDA
     if (PARAM.inp.device == "gpu")
     {
-        // === GPU compute path ===
+        // === GPU compute + postprocess path (combined, single D2H) ===
         const int N = ucell.nat;
         const int MN = NEP_GPU_MN;
         const int size_x12 = N * MN;
@@ -118,7 +138,7 @@ void ESolver_NEP::runner(UnitCell& ucell, const int istep)
             g_NN_angular, g_NL_angular,
             r12);
 
-        // Step 2: GPU neural network forward pass
+        // Step 2: GPU NN forward + postprocess (unit conversion + reduction)
         // r12 layout: [radial xyz][angular xyz], each block size_x12 doubles
         double* x12_radial    = r12.data();
         double* y12_radial    = r12.data() + size_x12;
@@ -127,11 +147,17 @@ void ESolver_NEP::runner(UnitCell& ucell, const int istep)
         double* y12_angular   = r12.data() + 4 * size_x12;
         double* z12_angular   = r12.data() + 5 * size_x12;
 
-        // NEP model parameters (all public members of NEP class)
         const auto& p = nep.paramb;
         const auto& a = nep.annmb;
 
-        nep_cuda_compute(
+        // Unit conversion factors (same as postprocess_outputs)
+        const double fact_e = 1.0 / ModuleBase::Ry_to_eV;
+        const double fact_f = 1.0 / (ModuleBase::Ry_to_eV * ModuleBase::ANGSTROM_AU);
+        const double fact_v = 1.0 / (ucell.omega * ModuleBase::Ry_to_eV);
+
+        // Combined GPU compute + postprocess — single D2H round-trip
+        // Output: nep_potential (1 double), nep_force (3*N interleaved), nep_virial (9 summed)
+        nep_cuda_compute_postprocessed(
             N,
             atype.data(),
             g_NN_radial.data(), g_NL_radial.data(),
@@ -149,25 +175,26 @@ void ESolver_NEP::runner(UnitCell& ucell, const int istep)
             p.rc_radial, p.rc_angular,
             a.c, a.num_para,
             // NEP_CPU stores ANN weights as const double* [MAX_TYPES] arrays.
-            // In NEP_CPU's memory layout, all types' weights are allocated
-            // contiguously (see nep.cpp init), so w0[0] points to the start
-            // of the full parameter block. The GPU kernel indexes into this
-            // flat buffer by (n * dim + d), which works because weights for
-            // all atom types are packed into a single allocation.
+            // w0[0] points to the start of the full contiguous parameter block.
             // Verified with HfO2 (2-type system): energy bit-exact vs CPU.
             a.w0[0], a.b0[0], a.w1[0], a.b1,
             p.q_scaler,
-            // Output buffers
-            _e.data(), _f.data(), _v.data());
+            // Unit conversion factors
+            fact_e, fact_f, fact_v,
+            // Output (postprocessed, single D2H)
+            &nep_potential, nep_force.c, nep_virial.c);
+
+        GlobalV::ofs_running << " #TOTAL ENERGY# " << std::setprecision(11)
+                             << nep_potential * ModuleBase::Ry_to_eV << " eV"
+                             << std::endl;
     }
     else
 #endif
     {
         // === CPU compute path (original) ===
         nep.compute(atype, cell, coord, _e, _f, _v);
+        postprocess_outputs(ucell);
     }
-
-    postprocess_outputs(ucell);
 #else
     ModuleBase::WARNING_QUIT("ESolver_NEP", "Please recompile with -D__NEP");
 #endif

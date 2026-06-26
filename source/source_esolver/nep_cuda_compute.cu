@@ -767,6 +767,206 @@ void nep_cuda_compute(
     cudaFree(d_fx); cudaFree(d_fy); cudaFree(d_fz); cudaFree(d_vir);
 }
 
+// ---- Postprocessing kernel (used by nep_cuda_compute_postprocessed) ----
+__global__ void nep_cuda_postprocess_combined_kernel(
+    int N,
+    const double *d_energy,     // [N] per-atom energy
+    const double *d_fx,         // [N] per-atom x-force
+    const double *d_fy,         // [N] per-atom y-force
+    const double *d_fz,         // [N] per-atom z-force
+    const double *d_virial,     // [9*N] per-atom virial
+    double fact_e, double fact_f, double fact_v,
+    double *d_pot_sum,          // [1] output summed energy
+    double *d_force_out,        // [3*N] interleaved output
+    double *d_vir_sum)          // [9] output summed virial
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+
+    // Energy: atomicAdd to sum
+    atomicAdd(d_pot_sum, d_energy[i] * fact_e);
+
+    // Force: SoA → interleaved with unit conversion
+    d_force_out[3 * i]     = d_fx[i] * fact_f;
+    d_force_out[3 * i + 1] = d_fy[i] * fact_f;
+    d_force_out[3 * i + 2] = d_fz[i] * fact_f;
+
+    // Virial: atomicAdd each of 9 components
+    for (int j = 0; j < 9; ++j)
+    {
+        atomicAdd(&d_vir_sum[j], d_virial[j * N + i] * fact_v);
+    }
+}
+
+// =====================================================================
+// Combined compute + postprocess (single GPU pass, one D2H round-trip)
+// =====================================================================
+
+void nep_cuda_compute_postprocessed(
+    int N,
+    const int *type,
+    const int *NN_radial, const int *NL_radial,
+    const int *NN_angular, const int *NL_angular,
+    const double *x12_radial, const double *y12_radial, const double *z12_radial,
+    const double *x12_angular, const double *y12_angular, const double *z12_angular,
+    int n_max_radial, int n_max_angular,
+    int basis_size_radial, int basis_size_angular,
+    int L_max, int num_L, int num_types, int num_types_sq, int num_c_radial,
+    int dim, int num_neurons1, int version,
+    const double *rc_radial, const double *rc_angular,
+    const double *ann_c, int num_para,
+    const double *w0, const double *b0, const double *w1, const double *b1,
+    const double *q_scaler,
+    double fact_e, double fact_f, double fact_v,
+    double *potential, double *force, double *virial)
+{
+    int size_type = N * sizeof(int);
+    int size_N = N * sizeof(int);
+    int size_double_N = N * sizeof(double);
+
+    int MN = NEP_CUDA_MN;
+    int size_nl = N * MN * sizeof(int);
+    int size_nl_d = N * MN * sizeof(double);
+
+    int *d_type, *d_NN_r, *d_NL_r, *d_NN_a, *d_NL_a;
+    double *d_x12_r, *d_y12_r, *d_z12_r;
+    double *d_x12_a, *d_y12_a, *d_z12_a;
+    double *d_rc_r, *d_rc_a, *d_ann_c, *d_w0, *d_b0, *d_w1, *d_b1, *d_qs;
+    double *d_pot, *d_Fp, *d_sfxyz, *d_fx, *d_fy, *d_fz, *d_vir;
+    // Postprocess output buffers
+    double *d_pot_sum, *d_force_out, *d_vir_sum;
+
+    CHECK_CUDA(cudaMalloc(&d_type, size_type));
+    CHECK_CUDA(cudaMalloc(&d_NN_r, size_N));
+    CHECK_CUDA(cudaMalloc(&d_NL_r, size_nl));
+    CHECK_CUDA(cudaMalloc(&d_NN_a, size_N));
+    CHECK_CUDA(cudaMalloc(&d_NL_a, size_nl));
+    CHECK_CUDA(cudaMalloc(&d_x12_r, size_nl_d));
+    CHECK_CUDA(cudaMalloc(&d_y12_r, size_nl_d));
+    CHECK_CUDA(cudaMalloc(&d_z12_r, size_nl_d));
+    CHECK_CUDA(cudaMalloc(&d_x12_a, size_nl_d));
+    CHECK_CUDA(cudaMalloc(&d_y12_a, size_nl_d));
+    CHECK_CUDA(cudaMalloc(&d_z12_a, size_nl_d));
+    CHECK_CUDA(cudaMalloc(&d_rc_r, sizeof(double) * num_types));
+    CHECK_CUDA(cudaMalloc(&d_rc_a, sizeof(double) * num_types));
+    CHECK_CUDA(cudaMalloc(&d_ann_c, sizeof(double) * num_para));
+    CHECK_CUDA(cudaMalloc(&d_w0, sizeof(double) * dim * num_neurons1));
+    CHECK_CUDA(cudaMalloc(&d_b0, sizeof(double) * num_neurons1));
+    CHECK_CUDA(cudaMalloc(&d_w1, sizeof(double) * (num_neurons1 + 1)));
+    CHECK_CUDA(cudaMalloc(&d_b1, sizeof(double)));
+    CHECK_CUDA(cudaMalloc(&d_qs, sizeof(double) * num_types * (n_max_radial + 1) * NEP_CUDA_NUM_OF_ABC));
+    CHECK_CUDA(cudaMalloc(&d_pot, size_double_N));
+    CHECK_CUDA(cudaMalloc(&d_Fp, sizeof(double) * (n_max_radial + 1 + dim) * N));
+    CHECK_CUDA(cudaMalloc(&d_sfxyz, sizeof(double) * (n_max_angular + 1) * NEP_CUDA_NUM_OF_ABC * N));
+    CHECK_CUDA(cudaMalloc(&d_fx, size_double_N));
+    CHECK_CUDA(cudaMalloc(&d_fy, size_double_N));
+    CHECK_CUDA(cudaMalloc(&d_fz, size_double_N));
+    CHECK_CUDA(cudaMalloc(&d_vir, sizeof(double) * 9 * N));
+    // Postprocess output
+    CHECK_CUDA(cudaMalloc(&d_pot_sum, sizeof(double)));
+    CHECK_CUDA(cudaMalloc(&d_force_out, sizeof(double) * 3 * N));
+    CHECK_CUDA(cudaMalloc(&d_vir_sum, sizeof(double) * 9));
+
+    // H2D copies (same as nep_cuda_compute)
+    CHECK_CUDA(cudaMemcpy(d_type, type, size_type, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_NN_r, NN_radial, size_N, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_NL_r, NL_radial, size_nl, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_NN_a, NN_angular, size_N, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_NL_a, NL_angular, size_nl, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_x12_r, x12_radial, size_nl_d, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_y12_r, y12_radial, size_nl_d, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_z12_r, z12_radial, size_nl_d, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_x12_a, x12_angular, size_nl_d, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_y12_a, y12_angular, size_nl_d, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_z12_a, z12_angular, size_nl_d, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_rc_r, rc_radial, sizeof(double) * num_types, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_rc_a, rc_angular, sizeof(double) * num_types, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_ann_c, ann_c, sizeof(double) * num_para, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_w0, w0, sizeof(double) * dim * num_neurons1, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_b0, b0, sizeof(double) * num_neurons1, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_w1, w1, sizeof(double) * (num_neurons1 + 1), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_b1, b1, sizeof(double), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_qs, q_scaler, sizeof(double) * num_types * (n_max_radial + 1) * NEP_CUDA_NUM_OF_ABC, cudaMemcpyHostToDevice));
+
+    // Zero device output buffers
+    CHECK_CUDA(cudaMemset(d_fx, 0, size_double_N));
+    CHECK_CUDA(cudaMemset(d_fy, 0, size_double_N));
+    CHECK_CUDA(cudaMemset(d_fz, 0, size_double_N));
+    CHECK_CUDA(cudaMemset(d_vir, 0, sizeof(double) * 9 * N));
+    CHECK_CUDA(cudaMemset(d_pot_sum, 0, sizeof(double)));
+    CHECK_CUDA(cudaMemset(d_vir_sum, 0, sizeof(double) * 9));
+
+    int block_size = 256;
+
+    // Kernel 1: descriptor + ANN
+    int grid_desc = (N + block_size - 1) / block_size;
+    nep_descriptor_ann_kernel<<<grid_desc, block_size>>>(
+        N, n_max_radial, n_max_angular, dim, basis_size_radial,
+        basis_size_angular, L_max, num_L, num_types, num_types_sq, num_c_radial,
+        num_neurons1,
+        d_type, d_NN_r, d_NL_r, d_NN_a, d_NL_a,
+        d_x12_r, d_y12_r, d_z12_r,
+        d_x12_a, d_y12_a, d_z12_a,
+        d_rc_r, d_rc_a, d_ann_c,
+        d_w0, d_b0, d_w1, d_b1, d_qs,
+        d_pot, d_Fp, d_sfxyz);
+    cudaDeviceSynchronize();
+
+    // Kernel 2: radial force
+    int total_pairs_radial = N * MN;
+    int grid_radial = (total_pairs_radial + block_size - 1) / block_size;
+    nep_force_radial_kernel<<<grid_radial, block_size>>>(
+        N, n_max_radial, n_max_angular, dim, basis_size_radial,
+        num_types_sq, num_c_radial,
+        d_type, d_NN_r, d_NL_r,
+        d_x12_r, d_y12_r, d_z12_r,
+        d_rc_r, d_ann_c, d_Fp,
+        d_fx, d_fy, d_fz);
+    cudaDeviceSynchronize();
+
+    // Kernel 3: angular force
+    int total_pairs_angular = N * MN;
+    int grid_angular = (total_pairs_angular + block_size - 1) / block_size;
+    nep_force_angular_kernel<<<grid_angular, block_size>>>(
+        N, n_max_radial, n_max_angular, dim,
+        basis_size_angular,
+        L_max, num_L, num_types, num_types_sq, num_c_radial,
+        d_type, d_NN_a, d_NL_a,
+        d_x12_a, d_y12_a, d_z12_a,
+        d_rc_a, d_ann_c,
+        d_Fp, d_sfxyz,
+        d_fx, d_fy, d_fz, d_vir);
+    cudaDeviceSynchronize();
+
+    // Kernel 4: postprocess (energy sum + force conversion + virial reduction)
+    int grid_pp = (N + block_size - 1) / block_size;
+    nep_cuda_postprocess_combined_kernel<<<grid_pp, block_size>>>(
+        N, d_pot, d_fx, d_fy, d_fz, d_vir,
+        fact_e, fact_f, fact_v,
+        d_pot_sum, d_force_out, d_vir_sum);
+    CHECK_LAST_CUDA_ERROR("nep_cuda_postprocess_combined_kernel");
+    cudaDeviceSynchronize();
+
+    // Single D2H copy of final results
+    CHECK_CUDA(cudaMemcpy(potential, d_pot_sum, sizeof(double), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(force, d_force_out, sizeof(double) * 3 * N, cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(virial, d_vir_sum, sizeof(double) * 9, cudaMemcpyDeviceToHost));
+
+    // Cleanup
+    cudaFree(d_type);
+    cudaFree(d_NN_r); cudaFree(d_NL_r);
+    cudaFree(d_NN_a); cudaFree(d_NL_a);
+    cudaFree(d_x12_r); cudaFree(d_y12_r); cudaFree(d_z12_r);
+    cudaFree(d_x12_a); cudaFree(d_y12_a); cudaFree(d_z12_a);
+    cudaFree(d_rc_r); cudaFree(d_rc_a);
+    cudaFree(d_ann_c);
+    cudaFree(d_w0); cudaFree(d_b0); cudaFree(d_w1); cudaFree(d_b1);
+    cudaFree(d_qs);
+    cudaFree(d_pot); cudaFree(d_Fp); cudaFree(d_sfxyz);
+    cudaFree(d_fx); cudaFree(d_fy); cudaFree(d_fz); cudaFree(d_vir);
+    cudaFree(d_pot_sum); cudaFree(d_force_out); cudaFree(d_vir_sum);
+}
+
 // =====================================================================
 // Timed version with CUDA Event profiling
 // =====================================================================
